@@ -118,13 +118,14 @@ def build_scene_clip(image_path, duration_seconds, out_path):
     """
     Build a single Ken-Burns zoom/pan clip from a still image.
 
-    Scales the image up 2x, crops back down, and applies zoompan so the
-    frame slowly zooms in over the clip's duration - the classic
+    Scales the image up 2x (preserving its aspect ratio and cropping to fill,
+    like CSS object-fit: cover - NOT a forced stretch), then applies zoompan
+    so the frame slowly zooms in over the clip's duration - the classic
     documentary / true-crime "moving photo" effect.
     """
     frames = max(1, round(duration_seconds * FPS))
     filter_str = (
-        f"scale={WIDTH*2}:{HEIGHT*2},"
+        f"scale={WIDTH*2}:{HEIGHT*2}:force_original_aspect_ratio=increase,"
         f"crop={WIDTH*2}:{HEIGHT*2},"
         f"zoompan=z='min(zoom+{ZOOM_RATE},{ZOOM_MAX})':d={frames}:s={WIDTH}x{HEIGHT}:fps={FPS}"
     )
@@ -151,13 +152,22 @@ def concat_clips(clip_paths, out_path, workdir):
 
 
 def mux_audio(video_path, audio_path, out_path):
-    """Mux the real voiceover audio onto the concatenated video."""
+    """
+    Mux the real voiceover audio onto the concatenated video.
+
+    Runs the audio through loudnorm so the final volume is consistent and
+    audible regardless of how loud/quiet the source narration file (e.g. the
+    ElevenLabs export) happens to be - without this, some voiceovers come
+    out far too quiet in the finished video.
+    """
     run_ffmpeg([
         "-i", video_path,
         "-i", audio_path,
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "copy",
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-c:a", "aac",
+        "-b:a", "192k",
         "-shortest",
         out_path,
     ])
@@ -263,7 +273,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "missing 'job' or 'voiceover' field"})
                 return
 
-            job = json.loads(fields[ "job"]["data"].decode())
+            job = json.loads(fields["job"]["data"].decode())
             scene_images = job.get("sceneImages", [])
             if not scene_images:
                 self._send_json(400, {"error": "sceneImages is empty"})
