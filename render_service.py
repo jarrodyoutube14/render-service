@@ -18,9 +18,20 @@ Endpoints:
                                                { "imageUrl": "https://...", "durationSeconds": 4.5 },
                                                { "imageUrl": "https://..." }   // durationSeconds optional
                                              ],
-                                             "jobId": "20"   // optional - see below
+                                             "jobId": "20",   // optional - see below
+                                             "captions": [    // optional - see below
+                                               { "word": "This", "start": 0.12, "end": 0.34 },
+                                               { "word": "changes", "start": 0.34, "end": 0.61 }
+                                             ]
                                            }
                             - "voiceover": binary field, the narration audio file
+
+                          "captions", if supplied, burns bold word-by-word captions into the
+                          video, timed from word-level start/end seconds (e.g. derived from
+                          ElevenLabs' character-level alignment data) - one short word on
+                          screen at a time, synced to the real narration. This requires
+                          re-encoding the video (burning pixels in), so a captioned render
+                          takes noticeably longer / costs more compute than a caption-less one.
                           Auth: header "X-Render-Key" must match RENDER_SERVICE_KEY env var.
                           Response: the rendered MP4, as raw bytes (video/mp4). Also sets a
                           response header "X-Video-Url" with a shareable link to the same
@@ -106,10 +117,10 @@ def probe_duration(path):
     return float(result.stdout.strip())
 
 
-def run_ffmpeg(args):
+def run_ffmpeg(args, cwd=None):
     """Run ffmpeg with -y (overwrite) and raise with stderr on failure."""
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"] + args
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {' '.join(cmd)}\n{result.stderr}")
 
@@ -171,6 +182,100 @@ def mux_audio(video_path, audio_path, out_path):
         "-shortest",
         out_path,
     ])
+
+
+def format_ass_time(seconds):
+    """Format seconds as an ASS subtitle timestamp: H:MM:SS.cc"""
+    total_centiseconds = max(0, round(seconds * 100))
+    hours, rem = divmod(total_centiseconds, 360000)
+    minutes, rem = divmod(rem, 6000)
+    secs, centis = divmod(rem, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def build_captions_ass(words, path):
+    """
+    Build an ASS subtitle file for bold, word-by-word "Shorts style" burned-in
+    captions - one short word on screen at a time, big and bold, centered,
+    synced to real narration timing (word-level start/end seconds, e.g. from
+    ElevenLabs' character-level alignment data).
+
+    Each word's on-screen time is extended up to the next word's start (so
+    captions don't flicker off during ordinary short gaps between words),
+    but capped so a long narration pause doesn't leave stale text lingering.
+    """
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {WIDTH}\n"
+        f"PlayResY: {HEIGHT}\n"
+        "ScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Caption,DejaVu Sans,110,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,7,0,5,80,80,40,1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    clean_words = [
+        w for w in words
+        if (w.get("word") or "").strip()
+        and w.get("start") is not None
+        and w.get("end") is not None
+        and w["end"] > w["start"]
+    ]
+
+    lines = [header]
+    for i, w in enumerate(clean_words):
+        start = w["start"]
+        end = w["end"]
+        if i + 1 < len(clean_words):
+            next_start = clean_words[i + 1]["start"]
+            gap = next_start - end
+            if 0 < gap < 0.6:
+                end = next_start  # bridge short gaps so captions don't flicker off
+        text = (
+            w["word"].strip().upper()
+            .replace("\\", "")
+            .replace("{", "")
+            .replace("}", "")
+            .replace("\n", " ")
+        )
+        lines.append(
+            f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Caption,,0,0,0,,{text}\n"
+        )
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
+def mux_audio_and_burn_captions(video_path, audio_path, captions_filename, out_path, workdir):
+    """
+    Mux the real voiceover audio onto the video AND burn in word-by-word
+    captions in a single ffmpeg pass.
+
+    Burning captions means re-encoding the video pixels (can't take the cheap
+    "-c:v copy" shortcut mux_audio() uses), so this path is slower / costs
+    more render compute than a caption-less render. captions_filename is
+    resolved relative to workdir (ffmpeg's subtitles filter is picky about
+    escaping colons/backslashes in absolute paths, so running with cwd=workdir
+    and a plain relative filename sidesteps that entirely).
+    """
+    run_ffmpeg([
+        "-i", video_path,
+        "-i", audio_path,
+        "-vf", f"subtitles={captions_filename}",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        out_path,
+    ], cwd=workdir)
 
 
 def parse_multipart(body, boundary):
@@ -284,6 +389,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "jobId must match ^[A-Za-z0-9_-]{1,128}$"})
                 return
 
+            captions = job.get("captions") or []
+            if not isinstance(captions, list):
+                self._send_json(400, {"error": "captions must be an array of {word, start, end}"})
+                return
+
             voiceover_bytes = fields["voiceover"]["data"]
 
             with tempfile.TemporaryDirectory() as workdir:
@@ -318,7 +428,14 @@ class Handler(BaseHTTPRequestHandler):
                 concat_clips(clip_paths, concatenated_path, workdir)
 
                 final_path = os.path.join(workdir, "final.mp4")
-                mux_audio(concatenated_path, voiceover_path, final_path)
+                if captions:
+                    captions_path = os.path.join(workdir, "captions.ass")
+                    build_captions_ass(captions, captions_path)
+                    mux_audio_and_burn_captions(
+                        concatenated_path, voiceover_path, "captions.ass", final_path, workdir
+                    )
+                else:
+                    mux_audio(concatenated_path, voiceover_path, final_path)
 
                 with open(final_path, "rb") as f:
                     final_bytes = f.read()
