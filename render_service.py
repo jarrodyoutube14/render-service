@@ -193,16 +193,65 @@ def format_ass_time(seconds):
     return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
+SENTENCE_END_RE = re.compile(r"[.!?]['\")\]]*$")
+CLAUSE_END_RE = re.compile(r"[,;]['\")\]]*$")
+
+# Caption phrase sizing - tuned so a clause/sentence reads like a film's
+# opening title card rather than a wall of text: short, a few words, capped
+# before any one run-on sentence could fill the whole screen.
+PHRASE_MAX_WORDS = 10
+PHRASE_MAX_DURATION = 5.0
+PHRASE_MIN_WORDS_FOR_CLAUSE_BREAK = 5
+
+
+def group_words_into_phrases(words):
+    """
+    Group word-level timing into short cinematic phrases - a sentence or a
+    few words at a time, the way a film's opening narration text appears,
+    rather than one word flashing at a time. Breaks preferentially at
+    sentence-ending punctuation, falls back to a comma/semicolon break for
+    long clauses, and always caps phrase length so a giant run-on sentence
+    can't end up filling the whole screen at once.
+    """
+    phrases = []
+    current = []
+    for w in words:
+        current.append(w)
+        word_text = w["word"]
+        duration_so_far = w["end"] - current[0]["start"]
+        word_count = len(current)
+        is_sentence_end = bool(SENTENCE_END_RE.search(word_text))
+        is_clause_break = (
+            bool(CLAUSE_END_RE.search(word_text))
+            and word_count >= PHRASE_MIN_WORDS_FOR_CLAUSE_BREAK
+        )
+        is_over_cap = word_count >= PHRASE_MAX_WORDS or duration_so_far >= PHRASE_MAX_DURATION
+        if is_sentence_end or is_clause_break or is_over_cap:
+            phrases.append({
+                "text": " ".join(x["word"] for x in current),
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+            })
+            current = []
+    if current:
+        phrases.append({
+            "text": " ".join(x["word"] for x in current),
+            "start": current[0]["start"],
+            "end": current[-1]["end"],
+        })
+    return phrases
+
+
 def build_captions_ass(words, path):
     """
-    Build an ASS subtitle file for bold, word-by-word "Shorts style" burned-in
-    captions - one short word on screen at a time, big and bold, centered,
-    synced to real narration timing (word-level start/end seconds, e.g. from
-    ElevenLabs' character-level alignment data).
+    Build an ASS subtitle file for cinematic caption phrases that fade in and
+    out, like the opening narration text of a film - a sentence or a few
+    words on screen at a time, centered, which gently fades away as the next
+    phrase fades in, rather than one word flashing on and off.
 
-    Each word's on-screen time is extended up to the next word's start (so
-    captions don't flicker off during ordinary short gaps between words),
-    but capped so a long narration pause doesn't leave stale text lingering.
+    Timing comes from word-level start/end seconds (e.g. ElevenLabs'
+    character-level alignment data, grouped into words upstream); phrases are
+    grouped here from that word-level timing.
     """
     header = (
         "[Script Info]\n"
@@ -214,8 +263,8 @@ def build_captions_ass(words, path):
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
         "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
         "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Caption,DejaVu Sans,110,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
-        "-1,0,0,0,100,100,0,0,1,7,0,5,80,80,40,1\n\n"
+        "Style: Caption,DejaVu Sans,72,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,"
+        "-1,0,0,0,100,100,0,0,1,4,1,5,160,160,40,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -228,24 +277,29 @@ def build_captions_ass(words, path):
         and w["end"] > w["start"]
     ]
 
+    phrases = group_words_into_phrases(clean_words)
+
     lines = [header]
-    for i, w in enumerate(clean_words):
-        start = w["start"]
-        end = w["end"]
-        if i + 1 < len(clean_words):
-            next_start = clean_words[i + 1]["start"]
+    for i, p in enumerate(phrases):
+        start = p["start"]
+        end = p["end"]
+        if i + 1 < len(phrases):
+            next_start = phrases[i + 1]["start"]
             gap = next_start - end
-            if 0 < gap < 0.6:
-                end = next_start  # bridge short gaps so captions don't flicker off
+            if 0 < gap < 1.0:
+                end = next_start  # bridge short gaps so text doesn't flicker off
         text = (
-            w["word"].strip().upper()
+            p["text"].strip()
             .replace("\\", "")
             .replace("{", "")
             .replace("}", "")
             .replace("\n", " ")
         )
+        # \fad(in_ms,out_ms): a gentle 400ms fade in and out, so each phrase
+        # dissolves into the next rather than cutting abruptly.
         lines.append(
-            f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Caption,,0,0,0,,{text}\n"
+            f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Caption,,0,0,0,,"
+            f"{{\\fad(400,400)}}{text}\n"
         )
 
     with open(path, "w", encoding="utf-8") as f:
