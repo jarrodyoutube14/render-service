@@ -49,7 +49,11 @@ Returns `{"status": "ok"}` - use this to confirm the service is up.
       { "imageUrl": "https://...", "durationSeconds": 4.5 },
       { "imageUrl": "https://..." }
     ],
-    "jobId": "20"
+    "jobId": "20",
+    "captions": [
+      { "word": "This", "start": 0.12, "end": 0.34 },
+      { "word": "changes", "start": 0.34, "end": 0.61 }
+    ]
   }
   ```
   `durationSeconds` is optional per scene - any scene that omits it gets an
@@ -60,6 +64,14 @@ Returns `{"status": "ok"}` - use this to confirm the service is up.
   saved under `/videos/<jobId>.mp4` (see below) so you get a link to it -
   good values are something already unique per run, like the n8n execution
   ID.
+
+  `captions` is optional too. If supplied, bold "Shorts style" word-by-word
+  captions are burned into the video - one short word on screen at a time,
+  big and bold and centered, timed to each word's real `start`/`end` seconds
+  (e.g. straight from ElevenLabs' character-level alignment data, grouped
+  into words). Burning captions means re-encoding the whole video instead of
+  the normal instant stream-copy, so a captioned render takes noticeably
+  longer and costs more Railway compute than a caption-less one.
 - `voiceover` - the binary narration audio file (e.g. the ElevenLabs output).
 
 **Response:** the rendered MP4, as raw bytes, `Content-Type: video/mp4`. If
