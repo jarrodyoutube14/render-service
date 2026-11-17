@@ -17,6 +17,9 @@ Railway charges for the compute itself.
    - `RENDER_SERVICE_KEY` - any random string you make up (this is the
      shared secret the n8n workflow sends to authenticate - treat it like
      a password, don't share it anywhere public).
+   - `VIDEO_RETENTION_DAYS` - optional, defaults to `14`. How many days a
+     rendered video stays available at its `/videos/<jobId>.mp4` link
+     before it's auto-deleted.
 5. Go to the **Settings** tab of the new service and click **Generate
    Domain** under Networking, so it gets a public `https://...up.railway.app`
    URL. Copy that URL - you'll need it to update the n8n workflow's render
@@ -45,12 +48,32 @@ Returns `{"status": "ok"}` - use this to confirm the service is up.
     "sceneImages": [
       { "imageUrl": "https://...", "durationSeconds": 4.5 },
       { "imageUrl": "https://..." }
-    ]
+    ],
+    "jobId": "20"
   }
   ```
   `durationSeconds` is optional per scene - any scene that omits it gets an
   equal share of whatever time is left after the voiceover's total length
   is divided up among the explicit-duration scenes.
+
+  `jobId` is optional too, but if you set it, the finished video also gets
+  saved under `/videos/<jobId>.mp4` (see below) so you get a link to it -
+  good values are something already unique per run, like the n8n execution
+  ID.
 - `voiceover` - the binary narration audio file (e.g. the ElevenLabs output).
 
-**Response:** the rendered MP4, as raw bytes, `Content-Type: video/mp4`.
+**Response:** the rendered MP4, as raw bytes, `Content-Type: video/mp4`. If
+`jobId` was set, the response also includes a header `X-Video-Url` with the
+shareable link to the same video.
+
+### `GET /videos/<jobId>.mp4`
+Serves back a video that was rendered with that `jobId`, so a notification
+email (or anything else) can just link straight to it instead of needing to
+pull it out of n8n's internal binary storage.
+
+This is a "grab it while it's fresh" link, not permanent hosting: videos are
+deleted automatically after `VIDEO_RETENTION_DAYS` days (default 14, set via
+that env var) to keep the service's disk usage bounded. There's also no
+authentication on this endpoint - the link itself (a long, effectively
+unguessable ID) is the only thing standing between someone and that one
+video, so don't rely on it for anything sensitive.
