@@ -11,16 +11,29 @@ multipart/form-data parser (no `cgi`, which is deprecated/removed in newer
 Python versions anyway) + calling out to ffmpeg/ffprobe on the system.
 
 Endpoints:
-  GET  /health   -> {"status": "ok"}
-  POST /render   -> multipart/form-data body with:
-                       - "job":       text field, JSON string:
-                                      { "sceneImages": [
-                                          { "imageUrl": "https://...", "durationSeconds": 4.5 },
-                                          { "imageUrl": "https://..." }   // durationSeconds optional
-                                        ] }
-                       - "voiceover": binary field, the narration audio file
-                     Auth: header "X-Render-Key" must match RENDER_SERVICE_KEY env var.
-                     Response: the rendered MP4, as raw bytes (video/mp4).
+  GET  /health        -> {"status": "ok"}
+  POST /render        -> multipart/form-data body with:
+                            - "job":       text field, JSON string:
+                                           { "sceneImages": [
+                                               { "imageUrl": "https://...", "durationSeconds": 4.5 },
+                                               { "imageUrl": "https://..." }   // durationSeconds optional
+                                             ],
+                                             "jobId": "20"   // optional - see below
+                                           }
+                            - "voiceover": binary field, the narration audio file
+                          Auth: header "X-Render-Key" must match RENDER_SERVICE_KEY env var.
+                          Response: the rendered MP4, as raw bytes (video/mp4). Also sets a
+                          response header "X-Video-Url" with a shareable link to the same
+                          video (see below), when "jobId" was supplied.
+  GET  /videos/<id>.mp4 -> the same rendered video, served back by its jobId. Lets a
+                          notification email (or anything else) link straight to a finished
+                          render instead of needing to pull it out of n8n's binary storage.
+                          Videos are kept on local disk for RETENTION_DAYS days and then
+                          deleted automatically to keep the service's disk usage bounded -
+                          this is a short-lived "grab it while it's fresh" link, not permanent
+                          hosting. The id is checked against a safe filename pattern - this
+                          endpoint has no auth, so anyone with the exact link (effectively
+                          unguessable, but not access-controlled) can fetch that one video.
 """
 
 import json
@@ -36,6 +49,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 RENDER_SERVICE_KEY = os.environ.get("RENDER_SERVICE_KEY", "")
 PORT = int(os.environ.get("PORT", "8080"))
 
+# Where finished renders are kept so a "/videos/<id>.mp4" link can serve them back.
+VIDEOS_DIR = os.environ.get("VIDEOS_DIR", "/app/videos")
+RETENTION_DAYS = float(os.environ.get("VIDEO_RETENTION_DAYS", "14"))
+JOB_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
 # Output video settings - 1920x1080, 30fps, matches standard YouTube export.
 WIDTH = 1920
 HEIGHT = 1080
@@ -48,6 +66,23 @@ ZOOM_MAX = 1.12
 
 def log(msg):
     print(f"[render_service] {msg}", file=sys.stderr, flush=True)
+
+
+def cleanup_old_videos():
+    """Delete saved videos older than RETENTION_DAYS, to keep disk usage bounded."""
+    if not os.path.isdir(VIDEOS_DIR):
+        return
+    cutoff = time.time() - (RETENTION_DAYS * 86400)
+    try:
+        for name in os.listdir(VIDEOS_DIR):
+            path = os.path.join(VIDEOS_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
 
 
 def download(url, dest_path):
@@ -174,8 +209,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif self.path.startswith("/videos/"):
+            self._serve_video(self.path[len("/videos/"):])
         else:
             self._send_json(404, {"error": "not found"})
+
+    def _serve_video(self, requested_name):
+        job_id = requested_name[:-4] if requested_name.endswith(".mp4") else requested_name
+        if not JOB_ID_RE.match(job_id):
+            self._send_json(400, {"error": "invalid video id"})
+            return
+        path = os.path.join(VIDEOS_DIR, f"{job_id}.mp4")
+        if not os.path.isfile(path):
+            self._send_json(404, {"error": "video not found (it may have expired or never finished rendering)"})
+            return
+        size = os.path.getsize(path)
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", str(size))
+        self.end_headers()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def do_POST(self):
         if self.path != "/render":
@@ -185,6 +243,8 @@ class Handler(BaseHTTPRequestHandler):
         if RENDER_SERVICE_KEY and self.headers.get("X-Render-Key") != RENDER_SERVICE_KEY:
             self._send_json(401, {"error": "unauthorized"})
             return
+
+        cleanup_old_videos()
 
         content_type = self.headers.get("Content-Type", "")
         boundary_match = re.search(r"boundary=(.+)$", content_type)
@@ -203,10 +263,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(400, {"error": "missing 'job' or 'voiceover' field"})
                 return
 
-            job = json.loads(fields["job"]["data"].decode())
+            job = json.loads(fields[ "job"]["data"].decode())
             scene_images = job.get("sceneImages", [])
             if not scene_images:
                 self._send_json(400, {"error": "sceneImages is empty"})
+                return
+
+            job_id = job.get("jobId")
+            if job_id is not None and not JOB_ID_RE.match(str(job_id)):
+                self._send_json(400, {"error": "jobId must match ^[A-Za-z0-9_-]{1,128}$"})
                 return
 
             voiceover_bytes = fields["voiceover"]["data"]
@@ -248,9 +313,22 @@ class Handler(BaseHTTPRequestHandler):
                 with open(final_path, "rb") as f:
                     final_bytes = f.read()
 
+            video_url = None
+            if job_id is not None:
+                os.makedirs(VIDEOS_DIR, exist_ok=True)
+                saved_path = os.path.join(VIDEOS_DIR, f"{job_id}.mp4")
+                with open(saved_path, "wb") as f:
+                    f.write(final_bytes)
+                host = self.headers.get("Host", "")
+                if host:
+                    video_url = f"https://{host}/videos/{job_id}.mp4"
+                log(f"saved render for jobId={job_id} -> {saved_path} ({video_url})")
+
             self.send_response(200)
             self.send_header("Content-Type", "video/mp4")
             self.send_header("Content-Length", str(len(final_bytes)))
+            if video_url:
+                self.send_header("X-Video-Url", video_url)
             self.end_headers()
             self.wfile.write(final_bytes)
 
